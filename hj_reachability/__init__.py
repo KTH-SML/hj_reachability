@@ -2,6 +2,7 @@ from hj_reachability import artificial_dissipation
 from hj_reachability import boundary_conditions
 from hj_reachability import finite_differences
 from hj_reachability import sets
+from hj_reachability import shapes
 from hj_reachability import solver
 from hj_reachability import systems
 from hj_reachability import time_integration

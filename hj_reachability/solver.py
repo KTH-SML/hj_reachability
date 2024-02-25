@@ -7,6 +7,7 @@ import jax.experimental.host_callback
 import jax.numpy as jnp
 import numpy as np
 
+import hj_reachability.shapes as shp
 from hj_reachability import artificial_dissipation
 from hj_reachability import time_integration
 from hj_reachability.finite_differences import upwind_first
@@ -76,19 +77,114 @@ def step(solver_settings, dynamics, grid, time, values, target_time, progress_ba
         return jax.lax.while_loop(lambda time_values: jnp.abs(target_time - time_values[0]) > 0, sub_step,
                                   (time, values))[1]
 
+# @functools.partial(jax.jit, static_argnames=("dynamics", "progress_bar"))
+# def solve(solver_settings, dynamics, grid, times, target, constraints=None, preempt_saturatation=False, progress_bar=True):
+#     with (_try_get_progress_bar(times[0], times[-1])
+#           if progress_bar is True else contextlib.nullcontext(progress_bar)) as bar:
+        
+#         is_target_invariant = shp.is_invariant(grid, times, target)
+#         is_constraints_invariant = shp.is_invariant(grid, times, constraints)
+#         initial = target if is_target_invariant else target[0, ...]
+#         if constraints is not None:
+#             initial = jnp.maximum(initial, constraints if is_constraints_invariant else constraints[0, ...])
+        
+#         def isempty(a):
+#             return jnp.all(a > 0)
+        
+#         i, values = 1, jnp.ones(times.shape + grid.shape)
+#         values = values.at[0].set(initial)
+#         def pred(val):
+#             i, _ = val
+#             return (0 <= i) & (i < len(times))
+#         def body(val):
+#             i, values = val
+#             values = step(solver_settings, dynamics, grid, times[i-1], values, times[i], bar)
+#             if not is_target_invariant:
+#                 values = jnp.minimum(values, target[i, ...])
+#             if constraints is not None:
+#                 c = constraints if is_constraints_invariant else constraints[i, ...]
+#                 values = jnp.maximum(values, c)
+#                 if preempt_saturatation and isempty(shp.setminus(c, values)):
+#                     i = -i-1
+#             return (i+1, values)
+#         i, values = jax.lax.while_loop(pred, body, (i, values))
+#         return values
 
 @functools.partial(jax.jit, static_argnames=("dynamics", "progress_bar"))
-def solve(solver_settings, dynamics, grid, times, initial_values, progress_bar=True):
+def solve(solver_settings, dynamics, grid, times, target, constraints=None, preempt_saturatation=False, progress_bar=True):
     with (_try_get_progress_bar(times[0], times[-1])
           if progress_bar is True else contextlib.nullcontext(progress_bar)) as bar:
-        make_carry_and_output_slice = lambda t, v: ((t, v), v)
+        
+        is_target_invariant = target.shape == grid.shape
+        is_constraints_invariant = constraints is None or constraints.shape == grid.shape
+        initial = target if is_target_invariant else target[0, ...]
+        if constraints is not None:
+            initial = jnp.maximum(initial, constraints if is_constraints_invariant else constraints[0, ...])
+        
+        def setminus(a, b):
+            return jnp.maximum(a, -b)
+        
+        def isempty(a):
+            return jnp.all(a > 0)
+        
+        @functools.partial(jax.jit, static_argnames=("grid", "dynamics", "progress_bar"))
+        def ident(solver_settings, dynamics, grid, time, values, target_time, progress_bar=True):
+            return values
+        
+        def f(carry, j):
+            i, values = carry
+            args = (solver_settings, dynamics, grid, times[i], values, times[j], bar)
+            values = jax.lax.switch((i < 0).astype(int), [ident, step], *args)
+            if not is_target_invariant:
+                values = jnp.minimum(values, target[j, ...])
+            if constraints is not None:
+                c = constraints if is_constraints_invariant else constraints[j, ...]
+                values = jnp.maximum(values, c)
+                if preempt_saturatation and isempty(setminus(c, values)):
+                    j *= -1
+            return ((j, values), values)
+        
+        (i, _), values = jax.lax.scan(f, (0, initial), np.arange(1, len(times)))
+        return jnp.concatenate([
+            initial[np.newaxis],
+            values[:jnp.abs(i)]
+        ])
+
+@functools.partial(jax.jit, static_argnames=("dynamics", "progress_bar"))
+def solve(solver_settings, dynamics, grid, times, target, constraints=None, progress_bar=True):
+    with (_try_get_progress_bar(times[0], times[-1])
+          if progress_bar is True else contextlib.nullcontext(progress_bar)) as bar:
+        is_target_invariant = shp.is_invariant(grid, times, target)
+        is_constraints_invariant = shp.is_invariant(grid, times, constraints)
+        initial_values = target if is_target_invariant else target[0, ...]
+        if constraints is not None:
+            initial_values = jnp.maximum(initial_values, constraints if is_constraints_invariant else constraints[0, ...])
+        def f(time_values, i): 
+            values = step(solver_settings, dynamics, grid, *time_values, times[i], bar)
+            if not is_target_invariant:
+                values = jnp.minimum(values, target[i, ...])
+            if not is_constraints_invariant:
+                values = jnp.maximum(values, constraints[i, ...])
+            elif constraints is not None:
+                values = jnp.maximum(values, constraints)
+            return ((times[i], values), values)
         return jnp.concatenate([
             initial_values[np.newaxis],
-            jax.lax.scan(
-                lambda time_values, target_time: make_carry_and_output_slice(
-                    target_time, step(solver_settings, dynamics, grid, *time_values, target_time, bar)),
-                (times[0], initial_values), times[1:])[1]
+            jax.lax.scan(f, (times[0], initial_values), np.arange(1, len(times)))[1]
         ])
+
+# @functools.partial(jax.jit, static_argnames=("dynamics", "progress_bar"))
+# def solve(solver_settings, dynamics, grid, times, initial_values, progress_bar=True):
+#     with (_try_get_progress_bar(times[0], times[-1])
+#           if progress_bar is True else contextlib.nullcontext(progress_bar)) as bar:
+#         make_carry_and_output_slice = lambda t, v: ((t, v), v)
+#         return jnp.concatenate([
+#             initial_values[np.newaxis],
+#             jax.lax.scan(
+#                 lambda time_values, target_time: make_carry_and_output_slice(
+#                     target_time, step(solver_settings, dynamics, grid, *time_values, target_time, bar)),
+#                 (times[0], initial_values), times[1:])[1]
+#         ])
 
 
 def _try_get_progress_bar(reference_time, target_time):
